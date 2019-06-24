@@ -190,7 +190,7 @@ handshake out inf self = do
     sendName = out $
         tag 'n' <>
         putn erlangVersion <>
-        putN (flagExtendedReferences .|. flagExtendedPidsPorts .|. flagUTF8Atoms) <>
+        putN (flagExtendedReferences .|. flagExtendedPidsPorts .|. flagUTF8Atoms .|. flagNewFunTags) <>
         putA self
 
     recvStatus = do

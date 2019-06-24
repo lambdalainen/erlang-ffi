@@ -27,7 +27,6 @@ module Foreign.Erlang.Network (
   ) where
 
 import Control.Exception        (assert, bracketOnError)
-import Control.Monad            (liftM)
 import Data.Binary.Get
 import Data.Bits                ((.|.))
 import Data.Char                (chr, ord)
@@ -100,7 +99,7 @@ sendMessage :: (Builder -> Builder) -> (Builder -> IO ()) -> Builder -> IO ()
 sendMessage pack out = out . pack
 
 recvMessage :: Int64 -> (Int64 -> IO B.ByteString) -> IO B.ByteString
-recvMessage hdrlen inf = (liftM (fromIntegral . unpack hdrlen) $ inf hdrlen) >>= inf
+recvMessage hdrlen inf = ((fromIntegral . unpack hdrlen) <$> inf hdrlen) >>= inf
   where
     unpack 2 = runGet getn
     unpack 4 = runGet getN
@@ -183,7 +182,7 @@ handshake out inf self = do
     recvStatus
     challenge <- recvChallenge
     let reply = erlDigest cookie challenge
-    challenge' <- liftM fromIntegral (randomIO :: IO Int)
+    challenge' <- fromIntegral <$> (randomIO :: IO Int)
     challengeReply reply challenge'
     recvChallengeAck cookie challenge'
 
@@ -248,41 +247,42 @@ epmdAsk epmd msg = withEpmd epmd $ \sock -> do
 
 recvAll :: Socket -> IO B.ByteString
 recvAll sock = (B.concat . reverse) <$> do_recv []
-  where
-  do_recv acc = do
-    r <- N.recv sock 4096
-    case r of
-      "" -> return acc
-      _  -> do_recv (r:acc)
+    where
+    do_recv acc = do
+        r <- N.recv sock 4096
+        case r of
+            "" -> return acc
+            _  -> do_recv (r:acc)
 
 recvN :: Socket -> Int64 -> IO B.ByteString
 recvN sock n = (B.concat . reverse) <$> do_recv [] n
-  where
-  do_recv acc 0    = return acc
-  do_recv acc left = do
-    r <- N.recv sock left
-    case r of
-      "" -> error $ "recvN: Peer closed connection"
-      _  -> do_recv (r:acc) (left - B.length r)
+    where
+    do_recv acc 0    = return acc
+    do_recv acc left = do
+        r <- N.recv sock left
+        case r of
+            "" -> error $ "recvN: Peer closed connection"
+            _  -> do_recv (r:acc) (left - B.length r)
 
 -- | Return the names and addresses of registered local Erlang nodes.
 epmdGetNames :: IO [String]
 epmdGetNames = do
     reply <- epmdAsk epmdLocal "n" -- 110 in ASCII
-    let txt = runGet (getN >> liftM B.unpack getRemainingLazyByteString) reply
+    let txt = runGet (getN >> fmap B.unpack getRemainingLazyByteString) reply
     return . lines $ txt
 
 -- | Return the port address of a named Erlang node.
 epmdGetPort :: Node -> IO ServiceName
 epmdGetPort node = do
-  reply <- epmdAsk epmd $ 'z' : nodeName
-  return $ flip runGet reply $ do
-                     _ <- getC
-                     res <- getC
-                     if res == 0
-                       then show <$> getn
-                       else error $ "epmdGetPort: node not found: " ++ show node
-    where (nodeName, epmd) = case node of
+    reply <- epmdAsk epmd $ 'z' : nodeName
+    return $ flip runGet reply $ do
+        _   <- getC
+        res <- getC
+        if res == 0
+          then show <$> getn
+          else error $ "epmdGetPort: node not found: " ++ show node
+    where
+    (nodeName, epmd) = case node of
                            Short name    -> (name, epmdLocal)
                            Long  name ip -> (name, ip)
 
@@ -291,12 +291,12 @@ epmdGetPortR4 :: String -> String -> IO (Int, Int, Int, Int, Int, String, String
 epmdGetPortR4 epmd name = do
     reply <- epmdAsk epmd $ 'z' : name
     return $ flip runGet reply $ do
-        _ <- getn
-        port <- getn
+        _        <- getn
+        port     <- getn
         nodeType <- getC
         protocol <- getC
-        vsnMax <- getn
-        vsnMin <- getn
-        name <- getn >>= getA
-        extra <- liftM B.unpack getRemainingLazyByteString
+        vsnMax   <- getn
+        vsnMin   <- getn
+        name     <- getn >>= getA
+        extra    <- B.unpack <$> getRemainingLazyByteString
         return (port, nodeType, protocol, vsnMax, vsnMin, name, extra)

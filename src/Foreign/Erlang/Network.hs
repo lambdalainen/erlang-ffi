@@ -8,6 +8,7 @@
 -- Stability   : experimental
 -- Portability : portable
 --
+{-# LANGUAGE OverloadedStrings #-}
 
 module Foreign.Erlang.Network (
   -- * Low-level communication with the Erlang Port-Mapper Daemon
@@ -31,15 +32,17 @@ import Data.Binary.Get
 import Data.Bits                ((.|.))
 import Data.Char                (chr, ord)
 import Data.Hash.MD5            (md5i, Str(..))
+import Data.Int
 import Data.List                (unfoldr)
 import Data.Word
 import Foreign.Erlang.Types
-import Network                  
+import Network.Socket
 import System.Directory         (getHomeDirectory)
 import System.FilePath          ((</>))
 import System.IO
 import System.Random            (randomIO)
 import qualified Data.ByteString.Lazy.Char8 as B
+import qualified Network.Socket.ByteString.Lazy as N
 import Data.ByteString.Lazy.Builder
 import Data.Monoid ((<>),mempty)
 
@@ -96,8 +99,8 @@ packN msg = putN (B.length msg') <> msg
 sendMessage :: (Builder -> Builder) -> (Builder -> IO ()) -> Builder -> IO ()
 sendMessage pack out = out . pack
 
-recvMessage :: Int -> (Int -> IO B.ByteString) -> IO B.ByteString
-recvMessage hdrlen inf = (liftM (unpack hdrlen) $ inf hdrlen) >>= inf
+recvMessage :: Int64 -> (Int64 -> IO B.ByteString) -> IO B.ByteString
+recvMessage hdrlen inf = (liftM (fromIntegral . unpack hdrlen) $ inf hdrlen) >>= inf
   where
     unpack 2 = runGet getn
     unpack 4 = runGet getN
@@ -153,23 +156,26 @@ instance Erlang Node where
     toErlang (Short name)   = ErlString name
     toErlang (Long name ip) = ErlString name
     fromErlang = undefined
+
+withNode :: HostName -> ServiceName -> (Socket -> IO a) -> IO a
+withNode epmd port = withSocketsDo . bracketOnError
+    (resolve epmd port >>= open)
+    close
           
 erlConnect :: String -> Node -> IO (ErlSend, ErlRecv)
 erlConnect self node = withSocketsDo $ do
     port <- epmdGetPort node
-    let port' = PortNumber . fromIntegral $ port
-    withNode epmd port' $ \h -> do
-        let out = sendMessage packn (hPutBuilder h)
-        let inf = recvMessage 2 (B.hGet h)
+    withNode epmd port $ \sock -> do
+        let out = sendMessage packn (N.sendAll sock . toLazyByteString)
+        let inf = recvMessage 2 (recvN sock)
         handshake out inf self
-        let out' = sendMessage packN (hPutBuilder h)
-        let inf' = recvMessage 4 (B.hGet h)
+        let out' = sendMessage packN (N.sendAll sock . toLazyByteString)
+        let inf' = recvMessage 4 (recvN sock)
         return (erlSend out', erlRecv inf')
     where epmd = case node of
                    Short _    -> epmdLocal
                    Long  _ ip -> ip
 
-                     
 handshake :: (Builder -> IO ()) -> IO B.ByteString -> String -> IO ()
 handshake out inf self = do
     cookie <- getUserCookie
@@ -215,43 +221,66 @@ handshake out inf self = do
 epmdLocal :: HostName
 epmdLocal = "127.0.0.1"
             
-epmdPort :: PortID
---epmdPort = Service "epmd"
-epmdPort = PortNumber 4369
+epmdPort :: ServiceName
+epmdPort = "4369"
 
-withNode :: String -> PortID -> (Handle -> IO a) -> IO a
-withNode epmd port = withSocketsDo . bracketOnError
-    (connectTo epmd port)
-    hClose
+resolve host port = do
+    let hints = defaultHints { addrSocketType = Stream }
+    addr:_ <- getAddrInfo (Just hints) (Just host) (Just port)
+    return addr
 
-withEpmd :: String -> (Handle -> IO a) -> IO a
+open addr = do
+    sock <- socket (addrFamily addr) (addrSocketType addr) (addrProtocol addr)
+    connect sock $ addrAddress addr
+    -- putStrLn $ "### Connected to " <> show addr
+    return sock
+
+withEpmd :: String -> (Socket -> IO a) -> IO a
 withEpmd epmd = withSocketsDo . bracketOnError
-    (connectTo epmd epmdPort)
-    hClose
+    (resolve epmd epmdPort >>= open)
+    close
 
-epmdSend     :: String -> String -> IO B.ByteString
-epmdSend epmd msg = withEpmd epmd $ \hdl -> do
+epmdAsk :: String -> String -> IO B.ByteString
+epmdAsk epmd msg = withEpmd epmd $ \sock -> do
     let out = putn (length msg) <> putA msg
-    hPutBuilder hdl out
-    hFlush hdl
-    B.hGetContents hdl
+    N.sendAll sock $ toLazyByteString out
+    recvAll sock
+
+recvAll :: Socket -> IO B.ByteString
+recvAll sock = (B.concat . reverse) <$> do_recv []
+  where
+  do_recv acc = do
+    r <- N.recv sock 4096
+    case r of
+      "" -> return acc
+      _  -> do_recv (r:acc)
+
+recvN :: Socket -> Int64 -> IO B.ByteString
+recvN sock n = (B.concat . reverse) <$> do_recv [] n
+  where
+  do_recv acc 0    = return acc
+  do_recv acc left = do
+    r <- N.recv sock left
+    case r of
+      "" -> error $ "recvN: Peer closed connection"
+      _  -> do_recv (r:acc) (left - B.length r)
 
 -- | Return the names and addresses of registered local Erlang nodes.
 epmdGetNames :: IO [String]
 epmdGetNames = do
-    reply <- epmdSend epmdLocal "n"
+    reply <- epmdAsk epmdLocal "n" -- 110 in ASCII
     let txt = runGet (getN >> liftM B.unpack getRemainingLazyByteString) reply
     return . lines $ txt
 
 -- | Return the port address of a named Erlang node.
-epmdGetPort      :: Node -> IO Int
+epmdGetPort :: Node -> IO ServiceName
 epmdGetPort node = do
-  reply <- epmdSend epmd $ 'z' : nodeName
+  reply <- epmdAsk epmd $ 'z' : nodeName
   return $ flip runGet reply $ do
                      _ <- getC
                      res <- getC
                      if res == 0
-                       then getn
+                       then show <$> getn
                        else error $ "epmdGetPort: node not found: " ++ show node
     where (nodeName, epmd) = case node of
                            Short name    -> (name, epmdLocal)
@@ -260,7 +289,7 @@ epmdGetPort node = do
 -- | Returns (port, nodeType, protocol, vsnMax, vsnMin, name, extra)
 epmdGetPortR4 :: String -> String -> IO (Int, Int, Int, Int, Int, String, String)
 epmdGetPortR4 epmd name = do
-    reply <- epmdSend epmd $ 'z' : name
+    reply <- epmdAsk epmd $ 'z' : name
     return $ flip runGet reply $ do
         _ <- getn
         port <- getn

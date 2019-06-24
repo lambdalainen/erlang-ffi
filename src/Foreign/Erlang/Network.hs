@@ -11,8 +11,9 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Foreign.Erlang.Network (
+    initErlangCookieWith
   -- * Low-level communication with the Erlang Port-Mapper Daemon
-    epmdGetNames
+  , epmdGetNames
   , epmdGetPort
   , epmdGetPortR4
   
@@ -26,12 +27,13 @@ module Foreign.Erlang.Network (
   , toNetwork
   ) where
 
-import Control.Exception        (assert, bracketOnError)
+import Control.Exception        (assert, bracketOnError, try, SomeException)
 import Data.Binary.Get
 import Data.Bits                ((.|.))
 import Data.Char                (chr, ord)
 import Data.Hash.MD5            (md5i, Str(..))
 import Data.Int
+import Data.IORef
 import Data.List                (unfoldr)
 import Data.Word
 import Foreign.Erlang.Types
@@ -39,11 +41,20 @@ import Network.Socket
 import System.Directory         (getHomeDirectory)
 import System.FilePath          ((</>))
 import System.IO
+import System.IO.Unsafe
 import System.Random            (randomIO)
 import qualified Data.ByteString.Lazy.Char8 as B
 import qualified Network.Socket.ByteString.Lazy as N
 import Data.ByteString.Lazy.Builder
 import Data.Monoid ((<>),mempty)
+
+erlangCookie :: IORef String
+{-# NOINLINE erlangCookie #-}
+erlangCookie = unsafePerformIO $ do
+  r <- try getUserCookie :: IO (Either SomeException String)
+  case r of
+    Left _       -> newIORef ""
+    Right cookie -> newIORef cookie
 
 erlangVersion :: Int
 erlangVersion = 5
@@ -68,6 +79,9 @@ flagUTF8Atoms          = 0x10000
 flagExtendedReferences :: Word32
 flagExtendedPidsPorts  :: Word32
 flagUTF8Atoms          :: Word32
+
+initErlangCookieWith :: IO String -> IO ()
+initErlangCookieWith user_func = user_func >>= writeIORef erlangCookie
 
 getUserCookie :: IO String
 getUserCookie = do
@@ -177,7 +191,7 @@ erlConnect self node = withSocketsDo $ do
 
 handshake :: (Builder -> IO ()) -> IO B.ByteString -> String -> IO ()
 handshake out inf self = do
-    cookie <- getUserCookie
+    cookie <- readIORef erlangCookie
     sendName
     recvStatus
     challenge <- recvChallenge
